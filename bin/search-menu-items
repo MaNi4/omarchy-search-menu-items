@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+
+"""Read what a window can do, and run one of the entries in its app.
+
+Entries come from, in order:
+  1. the app's menu bar (File > Save As...), read from the accessibility tree
+  2. the actions a GTK app exports over D-Bus (New Tab, Toggle Sidebar, ...)
+  3. the window's named buttons, when the app has no menu bar
+
+  search-menu-items --serve   what SearchMenuItems.qml runs: entries as JSON
+                              lines on stdout, commands on stdin
+  search-menu-items --print   list the entries
+
+Both read the focused window, or the one named by --window <address>.
+--debug says on stderr what was found where, and how long it took.
+
+Everything is asked over D-Bus a whole level at a time, not one call after
+another: an app answers a few thousand calls sent together in a fraction of
+the time it takes to wait for each in turn.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import signal
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ElementTree
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Callable, Iterator, NamedTuple
+
+from gi.repository import Gio, GLib
+
+log = logging.getLogger("search-menu-items")
+
+ACCESSIBLE = "org.a11y.atspi.Accessible"
+ACTION = "org.a11y.atspi.Action"
+APPLICATION = "org.a11y.atspi.Application"
+GTK_ACTIONS = "org.gtk.Actions"
+INTROSPECTABLE = "org.freedesktop.DBus.Introspectable"
+PROPERTIES = "org.freedesktop.DBus.Properties"
+
+# AT-SPI role and state numbers (atspi-constants.h).
+MENU, MENU_BAR, POPUP_MENU = 33, 34, 41
+ITEM_ROLES = {8, 35, 45}  # check menu item, menu item, radio menu item
+CONTROL_ROLES = ITEM_ROLES | {43, 62, 129}  # push button, toggle button, push button menu
+# Page content is not part of the app's own interface, and can be huge.
+CONTENT_ROLES = {60, 82, 92, 93, 94, 95, 96}  # terminal and the document roles
+ACTIVE, CHECKED, ENABLED, PRESSED, SENSITIVE, SHOWING = 1, 4, 8, 20, 24, 25
+
+MAX_DEPTH = 12
+MAX_NODES = 6000
+READ_BUDGET = 2.0  # seconds, per source
+CALL_TIMEOUT = 1500  # milliseconds
+ACTIONS_TIMEOUT = 300  # milliseconds; a connection without actions may not answer at all
+RUN_TIMEOUT = 2000  # milliseconds
+IDLE_TIMEOUT = 300  # seconds before a forgotten reader exits
+BATCH = 100  # entries per line, so a line stays a few kilobytes
+RUN_DELAY = 60  # milliseconds for the menu to close before an entry runs
+
+MODIFIERS = {
+    "<Primary>": "Ctrl+",
+    "<Control>": "Ctrl+",
+    "<Ctrl>": "Ctrl+",
+    "<Shift>": "Shift+",
+    "<Alt>": "Alt+",
+    "<Super>": "Super+",
+    "<Meta>": "Meta+",
+}
+MODIFIER_ORDER = ["Super", "Meta", "Ctrl", "Alt", "Shift"]
+
+EXPECTED_ERRORS = {
+    "org.freedesktop.DBus.Error.UnknownMethod",
+    "org.freedesktop.DBus.Error.UnknownInterface",
+    "org.freedesktop.DBus.Error.UnknownObject",
+}
+
+# Why an entry is listed but not run, when the app itself did not grey it out.
+SEVERAL_WINDOWS = "Several windows are open; which one is not known"
+SAME_TITLE = "Another window has the same title; which one is not known"
+
+Emit = Callable[[dict], None]
+
+
+# --- What is read ------------------------------------------------------------
+
+
+class Ref(NamedTuple):
+    """Where an object lives on a bus."""
+
+    bus: str
+    path: str
+
+
+DBUS = Ref("org.freedesktop.DBus", "/org/freedesktop/DBus")
+REGISTRY = Ref("org.a11y.atspi.Registry", "/org/a11y/atspi/accessible/root")
+
+
+@dataclass
+class Node:
+    """One object of the accessibility tree, as far as it was asked about."""
+
+    children: list[Ref] = field(default_factory=list)
+    role: int = -1
+    state: int = 0
+    name: str = ""
+    key: str = ""  # the shortcut, as the toolkit spells it
+    actions: int = 0
+
+    def has(self, state: int) -> bool:
+        return bool(self.state >> state & 1)
+
+    @property
+    def label(self) -> str:
+        return clean(self.name)
+
+    @property
+    def usable(self) -> bool:
+        return self.actions > 0 and (self.has(ENABLED) or self.has(SENSITIVE))
+
+
+@dataclass(frozen=True)
+class Press:
+    """Run by pressing an item or a button of the accessibility tree."""
+
+    ref: Ref
+
+
+@dataclass(frozen=True)
+class GtkAction:
+    """Run by activating an action a GTK app exports."""
+
+    bus: str
+    path: str
+    name: str
+
+
+@dataclass
+class Entry:
+    id: int
+    path: list[str]  # the menus it is in: ["File", "Export As"]
+    label: str
+    kind: str  # "menu", "action" or "button"
+    target: Press | GtkAction
+    key: str = ""
+    enabled: bool = True  # False when the app has greyed it out
+    checked: bool = False
+    why: str = ""  # set when it is listed for information only
+
+    @property
+    def runnable(self) -> bool:
+        return self.enabled and not self.why
+
+    def message(self) -> dict:
+        message = {"id": self.id, "path": self.path, "label": self.label, "key": self.key, "kind": self.kind}
+        if not self.runnable:
+            message["off"] = True
+        if self.why:
+            message["why"] = self.why
+        if self.checked:
+            message["on"] = True
+        return message
+
+
+class Entries:
+    """Every entry read so far. An entry's id is its position, which is what
+    the menu sends back to have it run."""
+
+    def __init__(self, emit: Emit):
+        self.emit = emit
+        self.all: list[Entry] = []
+        self.sent = 0
+
+    def add(self, path: list[str], label: str, kind: str, target: Press | GtkAction, *,
+            key: str = "", enabled: bool = True, checked: bool = False, why: str = "") -> None:
+        self.all.append(Entry(len(self.all), path, label, kind, target, key, enabled, checked, why))
+
+    def flush(self) -> int:
+        """Sends what was added since the last time; says how many that was."""
+        fresh = self.all[self.sent:]
+        for start in range(0, len(fresh), BATCH):
+            self.emit({"t": "items", "items": [entry.message() for entry in fresh[start:start + BATCH]]})
+        self.sent = len(self.all)
+        return len(fresh)
+
+
+def to_stdout(message: dict) -> None:
+    sys.stdout.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def to_nowhere(message: dict) -> None:
+    pass
+
+
+# --- Text --------------------------------------------------------------------
+
+
+def clean(text: str) -> str:
+    """One line, without the tooltip some toolkits append to a button's name."""
+    text = " ".join((text or "").replace("\t", " ").split())
+    return text if len(text) <= 70 else text[:69].rstrip() + "…"
+
+
+def shortcut(binding: str) -> str:
+    """"Ctrl+Shift+S" from what a toolkit reports: GTK gives "mnemonic;full
+    mnemonic path;accelerator", Qt the accelerator alone."""
+    binding = binding or ""
+    accelerator = binding.split(";")[-1]
+    # Without an accelerator Qt reports the item's Alt+letter mnemonic, which
+    # only works while its menu is open.
+    if not accelerator or (";" not in binding and re.fullmatch(r"Alt\+.", accelerator)):
+        return ""
+    for token, name in MODIFIERS.items():
+        accelerator = accelerator.replace(token, name)
+    if accelerator.endswith("+"):  # the key is "+" itself
+        held, key = [name for name in accelerator[:-1].split("+") if name], "+"
+    else:
+        *held, key = accelerator.split("+")
+    held.sort(key=lambda name: MODIFIER_ORDER.index(name) if name in MODIFIER_ORDER else len(MODIFIER_ORDER))
+    return "+".join(held + [key.upper() if len(key) == 1 else key.capitalize()])
+
+
+def humanize(action: str) -> str:
+    """"Toggle sidebar" from "toggle-sidebar"."""
+    words = re.sub(r"[-_.]+", " ", action).strip()
+    return words[:1].upper() + words[1:]
+
+
+# --- Hyprland ----------------------------------------------------------------
+
+
+def hyprctl(*arguments: str):
+    try:
+        out = subprocess.run(["hyprctl", *arguments, "-j"], capture_output=True, text=True, timeout=3).stdout
+        return json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        log.debug("hyprctl %s failed: %s", " ".join(arguments), error)
+        return None
+
+
+def find_window(address: str) -> dict:
+    """The window with that address, or the focused one when none is given."""
+    if address:
+        wanted = address.lower().removeprefix("0x")
+        for window in hyprctl("clients") or []:
+            if str(window.get("address", "")).lower().removeprefix("0x") == wanted:
+                return window
+    return hyprctl("activewindow") or {}
+
+
+# --- D-Bus -------------------------------------------------------------------
+
+
+class Batch:
+    """Sends many calls on one connection and waits for all the answers."""
+
+    def __init__(self, connection: Gio.DBusConnection, timeout: int = CALL_TIMEOUT):
+        self.connection = connection
+        self.timeout = timeout
+        self.loop = GLib.MainLoop()
+        self.pending = 0
+
+    def call(self, ref: Ref, interface: str, method: str, arguments: GLib.Variant | None,
+             done: Callable[[tuple | None], None]) -> None:
+        """`done` gets the reply, or None when there was none."""
+        self.pending += 1
+
+        def finished(connection, result):
+            try:
+                reply = connection.call_finish(result).unpack()
+            except GLib.Error as error:
+                # Most objects lack one interface or another; only say what is not that.
+                if (Gio.DBusError.get_remote_error(error) or "") not in EXPECTED_ERRORS:
+                    log.debug("%s.%s on %s %s: %s", interface, method, ref.bus, ref.path, error.message)
+                reply = None
+            done(reply)
+            self.pending -= 1
+            if self.pending == 0:
+                self.loop.quit()
+
+        self.connection.call(
+            ref.bus, ref.path, interface, method, arguments, None,
+            Gio.DBusCallFlags.NONE, self.timeout, None, finished,
+        )
+
+    def wait(self) -> None:
+        if self.pending:
+            self.loop.run()
+
+
+def accessibility_bus(session: Gio.DBusConnection) -> Gio.DBusConnection:
+    address = session.call_sync(
+        "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+        None, GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, 1000, None,
+    ).unpack()[0]
+    return Gio.DBusConnection.new_for_address_sync(
+        address,
+        Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+        None, None,
+    )
+
+
+def accessibility_enabled(session: Gio.DBusConnection) -> bool:
+    """Most toolkits only publish their interface once this is on."""
+    try:
+        value = session.call_sync(
+            "org.a11y.Bus", "/org/a11y/bus", PROPERTIES, "Get",
+            GLib.Variant("(ss)", ("org.a11y.Status", "IsEnabled")),
+            GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 1000, None,
+        ).unpack()[0]
+        return bool(value)
+    except GLib.Error:
+        return True
+
+
+def enable_accessibility() -> None:
+    # The setting lasts across sessions; the bus property applies it to this one.
+    subprocess.run(
+        ["gsettings", "set", "org.gnome.desktop.interface", "toolkit-accessibility", "true"],
+        capture_output=True, check=False,
+    )
+    subprocess.run(
+        ["busctl", "--user", "set-property", "org.a11y.Bus", "/org/a11y/bus",
+         "org.a11y.Status", "IsEnabled", "b", "true"],
+        capture_output=True, check=False,
+    )
+
+
+def owners(batch: Batch, names: list[str], pid: int) -> list[str]:
+    """The bus names that belong to the process."""
+    owned: list[str] = []
+
+    def keep(name: str, reply: tuple | None) -> None:
+        if reply and reply[0] == pid:
+            owned.append(name)
+
+    for name in names:
+        batch.call(DBUS, DBUS.bus, "GetConnectionUnixProcessID", GLib.Variant("(s)", (name,)), partial(keep, name))
+    batch.wait()
+    return owned
+
+
+# --- Accessibility tree ------------------------------------------------------
+
+
+def _children(node: Node, reply: tuple | None) -> None:
+    if reply:
+        node.children = [Ref(*child) for child in reply[0]]
+
+
+def _role(node: Node, reply: tuple | None) -> None:
+    if reply:
+        node.role = reply[0]
+
+
+def _state(node: Node, reply: tuple | None) -> None:
+    if reply:
+        low, high = reply[0]
+        node.state = low | high << 32
+
+
+def _name(node: Node, reply: tuple | None) -> None:
+    if reply:
+        node.name = reply[0]
+
+
+def _actions(node: Node, reply: tuple | None) -> None:
+    if reply:
+        node.actions = len(reply[0])
+        if reply[0] and not node.key:
+            node.key = reply[0][0][2]
+
+
+def _key(node: Node, reply: tuple | None) -> None:
+    if reply and reply[0]:
+        node.key = reply[0]
+
+
+class Tree:
+    """The accessibility tree of one app."""
+
+    def __init__(self, batch: Batch, qt: bool = False):
+        self.batch = batch
+        # Qt leaves the shortcut out of the action list and gives it only
+        # when asked: a second call per node, so not sent to other toolkits.
+        self.qt = qt
+
+    def fetch(self, refs: list[Ref], *, children: bool = False, role: bool = False, state: bool = False,
+              name: bool = False, actions: bool = False) -> dict[Ref, Node]:
+        """A node for every ref, with what was asked for, all asked at once."""
+        nodes = {ref: Node() for ref in refs}
+        call = self.batch.call
+        for ref, node in nodes.items():
+            if children:
+                call(ref, ACCESSIBLE, "GetChildren", None, partial(_children, node))
+            if role:
+                call(ref, ACCESSIBLE, "GetRole", None, partial(_role, node))
+            if state:
+                call(ref, ACCESSIBLE, "GetState", None, partial(_state, node))
+            if name:
+                call(ref, PROPERTIES, "Get", GLib.Variant("(ss)", (ACCESSIBLE, "Name")), partial(_name, node))
+            if actions:
+                call(ref, ACTION, "GetActions", None, partial(_actions, node))
+                if self.qt:
+                    call(ref, ACTION, "GetKeyBinding", GLib.Variant("(i)", (0,)), partial(_key, node))
+        self.batch.wait()
+        return nodes
+
+
+def app_frames(batch: Batch, pid: int) -> tuple[Tree, dict[Ref, Node]]:
+    """The app's tree and its windows."""
+    apps = Tree(batch).fetch([REGISTRY], children=True)[REGISTRY].children
+    by_bus = {ref.bus: ref for ref in apps}
+    # Only our own app is asked anything more: another one that hangs must not hold us up.
+    own = [by_bus[bus] for bus in owners(batch, list(by_bus), pid)]
+
+    toolkits: list[str] = []
+    for ref in own:
+        batch.call(ref, PROPERTIES, "Get", GLib.Variant("(ss)", (APPLICATION, "ToolkitName")),
+                   lambda reply: toolkits.append(reply[0]) if reply else None)
+    batch.wait()
+
+    tree = Tree(batch, qt="Qt" in toolkits)
+    frames = [frame for node in tree.fetch(own, children=True).values() for frame in node.children]
+    log.debug("accessibility: %d app object(s), toolkit %s, %d frame(s)", len(own), toolkits or "?", len(frames))
+    return tree, tree.fetch(frames, children=True, role=True, state=True, name=True)
+
+
+def choose_frames(frames: dict[Ref, Node], title: str) -> tuple[list[Ref], str]:
+    """The frames that could be the focused window, and why its items must not
+    be run ("" when they may).
+
+    The open menu holds the keyboard, so the app's frame is usually not marked
+    active any more and its title has to do. Two frames with the focused
+    window's title cannot be told apart: one of them is read, so its items can
+    be seen, but none is run, since it could be the other window's.
+    """
+    active = [ref for ref, node in frames.items() if node.has(ACTIVE)]
+    if active:
+        return active[:1], ""
+    titled = [ref for ref, node in frames.items() if title and node.name == title]
+    if titled:
+        return titled[:1], SAME_TITLE if len(titled) > 1 else ""
+    # No frame carries the title: fine when only one of them could be meant.
+    return list(frames), ""
+
+
+def find_menubar(tree: Tree, frame: Ref, node: Node, deadline: float) -> Ref | None:
+    level = [(frame, node)]
+    for _ in range(10):
+        below: list[Ref] = []
+        for ref, current in level:
+            if current.role == MENU_BAR:
+                return ref
+            if current.role not in CONTENT_ROLES:
+                below.extend(current.children)
+        if not below or time.monotonic() > deadline:
+            return None
+        level = list(tree.fetch(below[:MAX_NODES], children=True, role=True).items())
+    return None
+
+
+class Window(NamedTuple):
+    frame: Ref | None  # None when it could not be told which frame it is
+    menubar: Ref | None
+    why: str
+
+
+def pick_window(tree: Tree, frames: dict[Ref, Node], title: str, deadline: float) -> Window:
+    candidates, why = choose_frames(frames, title)
+    with_menu = []
+    for ref in candidates:
+        menubar = find_menubar(tree, ref, frames[ref], deadline)
+        if menubar is not None:
+            with_menu.append((ref, menubar))
+    if len(with_menu) == 1:
+        return Window(with_menu[0][0], with_menu[0][1], why)
+    if len(candidates) == 1:
+        return Window(candidates[0], None, why)
+    return Window(None, None, why)
+
+
+def menu_items(nodes: dict[Ref, Node], menu: Ref, path: tuple[str, ...] = ()) -> Iterator[tuple[list[str], Ref, Node]]:
+    """Every item below `menu` in the app's order, with the menus it is in."""
+    for child in nodes[menu].children:
+        node = nodes.get(child)
+        if node is None:
+            continue
+        if node.role == POPUP_MENU:
+            # Qt hangs a submenu's items off an unnamed popup under the item.
+            yield from menu_items(nodes, child, path)
+        elif node.role == MENU or (node.role in ITEM_ROLES and node.children):
+            if node.label:
+                yield from menu_items(nodes, child, path + (node.label,))
+        elif node.role in ITEM_ROLES and node.label:
+            yield list(path), child, node
+
+
+def read_menu(tree: Tree, menubar: Ref, entries: Entries, deadline: float, why: str) -> None:
+    """The whole menu bar, a level at a time."""
+    nodes = tree.fetch([menubar], children=True)
+    level = nodes[menubar].children
+    depth = 0
+    while level and depth <= MAX_DEPTH and len(nodes) < MAX_NODES and time.monotonic() < deadline:
+        fetched = tree.fetch(level, children=True, role=True, state=True, name=True, actions=True)
+        nodes.update(fetched)
+        if depth == 0:
+            # The top-level names are enough to show the menu; the rest follows.
+            entries.emit({"t": "sections", "names": [fetched[ref].label for ref in level if fetched[ref].label]})
+        level = [child for ref in level for child in fetched[ref].children if child not in nodes]
+        depth += 1
+
+    for path, ref, node in menu_items(nodes, menubar):
+        entries.add(path, node.label, "menu", Press(ref), key=shortcut(node.key),
+                    enabled=node.usable, checked=node.has(CHECKED), why=why)
+    sent = entries.flush()
+    log.debug("menu bar: %d node(s), %d level(s), %d item(s)", len(nodes), depth, sent)
+
+
+def read_controls(tree: Tree, frame: Ref, entries: Entries, deadline: float, why: str, content: bool = False) -> int:
+    """The window's named buttons; says how many. Page content is left out
+    unless asked for."""
+    level = [frame]
+    seen = 0
+    for _ in range(30):
+        if not level or seen >= MAX_NODES or time.monotonic() > deadline:
+            break
+        level = level[: MAX_NODES - seen]
+        seen += len(level)
+        fetched = tree.fetch(level, children=True, role=True, state=True, name=True)
+        controls = [ref for ref in level
+                    if fetched[ref].role in CONTROL_ROLES and fetched[ref].label and fetched[ref].has(SHOWING)]
+        acting = tree.fetch(controls, actions=True)
+
+        below: list[Ref] = []
+        for ref in level:
+            node = fetched[ref]
+            if node.role in CONTENT_ROLES and not content:
+                continue
+            if ref in acting:
+                node.key, node.actions = acting[ref].key, acting[ref].actions
+                if node.usable:
+                    entries.add([], node.label, "button", Press(ref), key=shortcut(node.key),
+                                checked=node.has(CHECKED) or node.has(PRESSED), why=why)
+            below.extend(node.children)
+        level = below
+
+    found = entries.flush()
+    log.debug("buttons%s: %d node(s), %d button(s)", " with page content" if content else "", seen, found)
+    return found
+
+
+# --- GTK actions over D-Bus --------------------------------------------------
+
+
+def action_root(identity: str) -> str:
+    """"/org/gnome/Nautilus" from "org.gnome.Nautilus"."""
+    return "/" + identity.replace(".", "/").replace("-", "_")
+
+
+def action_groups(root: str, windows: list[str]) -> list[tuple[str, str]]:
+    """(path, why not to run) for the app's own action group and its windows'.
+
+    Actions are exported once per window, and D-Bus does not say which window
+    is the focused one. With one window they are its; with several they are
+    still listed, from the first, but not run: the wrong window could take it.
+    """
+    groups = [(root, "")]
+    if windows:
+        groups.append((f"{root}/window/{sorted(windows)[0]}", SEVERAL_WINDOWS if len(windows) > 1 else ""))
+    return groups
+
+
+def action_sources(owned: list[str], app_id: str) -> list[tuple[str, str]]:
+    """(bus name, action root) to look under.
+
+    An app's first process owns its name ("org.gnome.Nautilus") and the
+    actions live under it. A further process of the same app has only its
+    connection (":1.140"); its actions are at the same path, which the
+    window's app id gives.
+    """
+    sources = [(name, action_root(name)) for name in sorted(owned) if not name.startswith(":")]
+    if "." in app_id:
+        sources += [(name, action_root(app_id)) for name in sorted(owned) if name.startswith(":")]
+    return sources
+
+
+def window_names(xml: str) -> list[str]:
+    try:
+        return [node.get("name") or "" for node in ElementTree.fromstring(xml).findall("node")]
+    except ElementTree.ParseError:
+        return []
+
+
+def read_gtk_actions(session: Gio.DBusConnection, pid: int, app_id: str, entries: Entries) -> None:
+    batch = Batch(session, ACTIONS_TIMEOUT)
+    names: list[str] = []
+    batch.call(DBUS, DBUS.bus, "ListNames", None, lambda reply: names.extend(reply[0]) if reply else None)
+    batch.wait()
+    owned = owners(batch, [name for name in names if not name.startswith("org.freedesktop.")], pid)
+    sources = action_sources(owned, app_id)
+
+    windows: dict[tuple[str, str], list[str]] = {}
+    for bus, root in sources:
+        batch.call(Ref(bus, root + "/window"), INTROSPECTABLE, "Introspect", None,
+                   lambda reply, key=(bus, root): windows.update({key: window_names(reply[0])}) if reply else None)
+    batch.wait()
+
+    groups = [(bus, path, why) for bus, root in sources for path, why in action_groups(root, windows.get((bus, root), []))]
+    described: dict[tuple[str, str], dict] = {}
+    for bus, path, _ in groups:
+        batch.call(Ref(bus, path), GTK_ACTIONS, "DescribeAll", None,
+                   lambda reply, key=(bus, path): described.update({key: reply[0]}) if reply else None)
+    batch.wait()
+
+    seen: set[str] = set()
+    for bus, path, why in groups:
+        for action, (enabled, parameter_type, state) in sorted(described.get((bus, path), {}).items()):
+            # Actions that need an argument cannot be run from a plain list.
+            if parameter_type or action in seen:
+                continue
+            seen.add(action)
+            entries.add([], humanize(action), "action", GtkAction(bus, path, action),
+                        enabled=enabled, checked=bool(state) and state[0] is True, why=why)
+    sent = entries.flush()
+    log.debug("gtk actions: %d bus name(s), %d group(s), %d action(s)", len(owned), len(groups), sent)
+
+
+# --- Reading and running -----------------------------------------------------
+
+
+def read(window: dict, session: Gio.DBusConnection, accessibility: Gio.DBusConnection | None, emit: Emit) -> Entries:
+    """Sends every entry of the window, then how it went."""
+    entries = Entries(emit)
+    pid = window.get("pid")
+    if not pid:
+        emit({"t": "done", "status": "no-window"})
+        return entries
+    started = time.monotonic()
+
+    tree = None
+    found = Window(None, None, "")
+    if accessibility is not None:
+        tree, frames = app_frames(Batch(accessibility), pid)
+        found = pick_window(tree, frames, window.get("title") or "", time.monotonic() + READ_BUDGET)
+        log.debug("window: frame %s, menu bar %s%s", found.frame and found.frame.path,
+                  found.menubar and found.menubar.path, f" ({found.why})" if found.why else "")
+        if found.menubar is not None:
+            read_menu(tree, found.menubar, entries, time.monotonic() + READ_BUDGET, found.why)
+    has_menu = bool(entries.all)
+
+    if tree is None or not tree.qt:
+        read_gtk_actions(session, pid, window.get("class") or "", entries)
+
+    if tree is not None and found.frame is not None and not has_menu:
+        deadline = time.monotonic() + READ_BUDGET
+        buttons = read_controls(tree, found.frame, entries, deadline, found.why)
+        # An Electron app draws its whole interface as a web page.
+        if not buttons and not entries.all:
+            read_controls(tree, found.frame, entries, deadline, found.why, content=True)
+
+    if entries.all:
+        status = "ok"
+    else:
+        status = "empty" if accessibility_enabled(session) else "accessibility-off"
+    log.debug("%d entries, %s, %.0f ms", len(entries.all), status, (time.monotonic() - started) * 1000)
+    emit({"t": "done", "status": status})
+    return entries
+
+
+def run(entry: Entry, session: Gio.DBusConnection, accessibility: Gio.DBusConnection | None) -> str:
+    """Empty when it worked, else why it did not."""
+    if not entry.runnable:
+        return "that entry is not available"
+    target = entry.target
+    try:
+        if isinstance(target, GtkAction):
+            session.call_sync(
+                target.bus, target.path, GTK_ACTIONS, "Activate",
+                GLib.Variant("(sava{sv})", (target.name, [], {})),
+                None, Gio.DBusCallFlags.NONE, RUN_TIMEOUT, None,
+            )
+            return ""
+        if accessibility is None:
+            return "the accessibility bus is gone"
+        accepted = accessibility.call_sync(
+            target.ref.bus, target.ref.path, ACTION, "DoAction", GLib.Variant("(i)", (0,)),
+            GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, RUN_TIMEOUT, None,
+        ).unpack()[0]
+        return "" if accepted else "the app refused that action"
+    except GLib.Error as error:
+        # An item that opens a dialog may only answer once it is closed.
+        if error.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT):
+            return ""
+        return error.message
+
+
+def parse_command(line: str) -> tuple[str, int]:
+    """("run", id), ("accessibility", 0), or ("", 0) for anything else."""
+    words = line.split()
+    if len(words) == 2 and words[0] == "run" and words[1].isdigit():
+        return "run", int(words[1])
+    if words == ["accessibility"]:
+        return "accessibility", 0
+    return "", 0
+
+
+def serve(entries: Entries, session: Gio.DBusConnection, accessibility: Gio.DBusConnection | None) -> None:
+    """Runs the commands SearchMenuItems.qml writes to stdin, until it closes it."""
+    loop = GLib.MainLoop()
+
+    def run_entry(entry_id: int) -> bool:
+        error = run(entries.all[entry_id], session, accessibility) if entry_id < len(entries.all) else "that entry is gone"
+        entries.emit({"t": "ran", "error": error})
+        loop.quit()
+        return False
+
+    def command(_source, condition) -> bool:
+        line = sys.stdin.readline() if condition & GLib.IOCondition.IN else ""
+        if not line:
+            loop.quit()
+            return False
+        name, entry_id = parse_command(line)
+        if name == "run":
+            # The menu closes as it asks; being stopped with it must not lose
+            # the run. It waits a moment, so the app has the focus back.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            GLib.timeout_add(RUN_DELAY, run_entry, entry_id)
+            return False
+        if name == "accessibility":
+            enable_accessibility()
+            entries.emit({"t": "accessibility", "on": accessibility_enabled(session)})
+        return True
+
+    GLib.io_add_watch(sys.stdin.fileno(), GLib.PRIORITY_DEFAULT,
+                      GLib.IOCondition.IN | GLib.IOCondition.HUP, command)
+    GLib.timeout_add_seconds(IDLE_TIMEOUT, loop.quit)
+    loop.run()
+
+
+def print_entries(entries: Entries) -> None:
+    for entry in entries.all:
+        label = " > ".join(entry.path + [entry.label])
+        print("\t".join(part for part in (label, entry.key, "" if entry.runnable else "off") if part))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Read what a window can do, and run one of the entries in its app.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--serve", action="store_true", help="entries as JSON lines on stdout, commands on stdin")
+    mode.add_argument("--print", action="store_true", help="list the entries")
+    parser.add_argument("--window", default="", metavar="ADDRESS", help="a Hyprland window address; the focused window otherwise")
+    parser.add_argument("--debug", action="store_true", help="say on stderr what was found where")
+    options = parser.parse_args()
+    logging.basicConfig(stream=sys.stderr, format="%(name)s: %(message)s",
+                        level=logging.DEBUG if options.debug else logging.WARNING)
+
+    window = find_window(options.window)
+    log.debug("window: %s pid %s %r", window.get("class"), window.get("pid"), window.get("title"))
+    session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    try:
+        accessibility = accessibility_bus(session)
+    except GLib.Error as error:
+        log.debug("no accessibility bus: %s", error.message)
+        accessibility = None
+
+    if options.print:
+        print_entries(read(window, session, accessibility, to_nowhere))
+        return 0
+
+    to_stdout({"t": "window", "class": window.get("class") or "", "title": window.get("title") or ""})
+    serve(read(window, session, accessibility, to_stdout), session, accessibility)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "mani4.search-menu-items",
+  "name": "Search Menu Items",
+  "version": "1.0.0",
+  "author": "MaNi4",
+  "license": "MIT",
+  "description": "Search the menu items of the focused app. One key lists File, Edit, Help and the rest with their shortcuts in an Omarchy menu; type to search, step into a menu, and run what you pick in the app",
+  "kinds": [
+    "overlay",
+    "service"
+  ],
+  "entryPoints": {
+    "overlay": "SearchMenuItems.qml",
+    "service": "Service.qml"
+  },
+  "homepage": "https://github.com/MaNi4/omarchy-search-menu-items",
+  "keepLoaded": true
+}
