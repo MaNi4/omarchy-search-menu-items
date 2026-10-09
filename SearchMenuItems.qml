@@ -373,6 +373,7 @@ Item {
     border.color: Util.alpha(cap.tint, 0.18)
 
     Text {
+      textFormat: Text.PlainText
       id: capText
       anchors.centerIn: parent
       text: cap.label
@@ -389,6 +390,7 @@ Item {
     spacing: Style.space(5)
     Keycap { label: parent.keyLabel; anchors.verticalCenter: parent.verticalCenter }
     Text {
+      textFormat: Text.PlainText
       anchors.verticalCenter: parent.verticalCenter
       text: parent.text
       color: root.foreground
@@ -481,6 +483,7 @@ Item {
                 spacing: Style.space(6)
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: crumb.modelData
                   color: root.foreground
@@ -491,6 +494,7 @@ Item {
                   width: Math.min(implicitWidth, root.cardWidth * (crumb.here ? 0.34 : 0.16))
                 }
                 Text {
+                  textFormat: Text.PlainText
                   anchors.verticalCenter: parent.verticalCenter
                   text: "›"
                   color: root.foreground
@@ -523,6 +527,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               anchors.fill: parent
               verticalAlignment: Text.AlignVCenter
               visible: !input.text
@@ -564,6 +569,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: tally
             anchors.right: parent.right
             anchors.rightMargin: Style.space(4)
@@ -616,6 +622,7 @@ Item {
 
             // A folder for a menu to step into, a tick for what is switched on.
             Text {
+              textFormat: Text.PlainText
               id: tick
               anchors.left: parent.left
               anchors.leftMargin: Style.spacing.md
@@ -630,6 +637,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: label
               anchors.left: tick.right
               anchors.leftMargin: Style.spacing.sm
@@ -645,6 +653,7 @@ Item {
 
             // Where a search result lives: "File › Export As".
             Text {
+              textFormat: Text.PlainText
               anchors.left: label.right
               anchors.leftMargin: Style.spacing.lg
               anchors.right: trailing.left
@@ -678,6 +687,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: rowItem.section && rowItem.modelData.count > 0
                 anchors.verticalCenter: parent.verticalCenter
                 text: rowItem.section ? String(rowItem.modelData.count) : ""
@@ -688,6 +698,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: rowItem.section
                 anchors.verticalCenter: parent.verticalCenter
                 text: "›"
@@ -721,6 +732,7 @@ Item {
 
         // ---------- nothing to list ----------
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           height: root.rowHeight * 2
           visible: root.rows.length === 0 || root.explain !== ""
