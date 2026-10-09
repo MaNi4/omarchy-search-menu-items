@@ -41,6 +41,10 @@ As.
 
 ![Searching for "export"](screenshots/search.png)
 
+When a window has several panes with the same buttons, each button shows the
+title of its pane and is found by it: `graph more`. Panes with the same title
+are numbered: Welcome, Welcome 2.
+
 Items appear in the same order as in the app. A tick marks an item that is
 switched on. Items that are currently unavailable are dimmed and cannot be run.
 
@@ -86,7 +90,7 @@ The plugin can only show what an app makes available, so results vary:
 | Apps with a menu bar, including LibreOffice, Kdenlive, Xournal++ and most GTK 3 and Qt apps | The full menu bar, with shortcuts |
 | GTK 4 apps without a menu bar, such as Files and Ghostty | App actions (New Tab, Preferences and so on) and the window's buttons |
 | Other apps without a menu bar, such as Pinta and Firefox-based browsers | The window's buttons |
-| Chromium and Electron apps, such as Obsidian | Nothing by default. The buttons of the interface if the app is started with a flag (see below) |
+| Chromium and Electron apps, such as Obsidian and VS Code | Nothing by default. If the app is started with a flag (see below), the buttons of the interface, and the menus they open, with shortcuts where the app shows them |
 
 ### Accessibility support
 
@@ -114,9 +118,22 @@ are already running have to be restarted before their menus appear.
   them with `--force-renderer-accessibility` makes the buttons of their
   interface available, for example New Tab, Reload and Extensions in
   Chromium. To set the flag permanently, add it
-  on its own line to `~/.config/chromium-flags.conf` for Chromium, or to
+  on its own line to `~/.config/chromium-flags.conf` for Chromium, to
   `~/.config/obsidian/user-flags.conf` for Obsidian installed from the Arch
-  package, and restart the app.
+  package, or to `~/.config/code-flags.conf` for VS Code installed from
+  `visual-studio-code-bin`, and restart the app. The menu says so when an app
+  of this kind shows nothing.
+
+  In these apps a menu such as More options in Obsidian, or File in VS Code,
+  only exists once its button is pressed. Choose the button and the plugin
+  opens the menu in the app and lets you step into it, sub-menus included.
+  Going back closes it again, by sending the window an Escape key. Its items
+  are not part of a search before that. A button that opens a dialog or
+  nothing at all is simply run. Shortcuts are shown where the app writes them
+  next to an item, as VS Code does.
+
+  VS Code turns on its screen reader mode with the flag; set
+  `"editor.accessibilitySupport": "off"` to keep the editor as it was.
 
 The bottom line of the menu explains why a dimmed item cannot be run when the
 reason is one of the above.
@@ -150,6 +167,10 @@ closes. It collects items for the focused window from three sources:
 2. The actions a GTK app exports over D-Bus (`org.gtk.Actions`).
 3. The window's buttons, if the app has no menu bar. Page content is ignored,
    except in Electron apps, where the page is the entire interface.
+
+When a button in such an app is chosen, the reader presses it and looks at
+what the page has drawn since: something the page marks as a menu (VS Code),
+or a new layer over the page that holds only things to click (Obsidian).
 
 The accessibility tree is read over D-Bus one menu level at a time, with all
 calls for a level sent together rather than one after another. This keeps large

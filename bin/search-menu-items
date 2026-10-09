@@ -6,6 +6,8 @@ Entries come from, in order:
   1. the app's menu bar (File > Save As...), read from the accessibility tree
   2. the actions a GTK app exports over D-Bus (New Tab, Toggle Sidebar, ...)
   3. the window's named buttons, when the app has no menu bar
+  4. a menu the app only draws once one of those buttons is pressed, when the
+     menu asks for it to be opened
 
   search-menu-items --serve   what SearchMenuItems.qml runs: entries as JSON
                               lines on stdout, commands on stdin
@@ -36,6 +38,13 @@ from typing import Callable, Iterator, NamedTuple
 
 from gi.repository import Gio, GLib
 
+try:
+    from gi.repository import GLibUnix
+
+    unix_signal_add = GLibUnix.signal_add
+except ImportError:  # GLib before 2.80
+    unix_signal_add = GLib.unix_signal_add
+
 log = logging.getLogger("search-menu-items")
 
 ACCESSIBLE = "org.a11y.atspi.Accessible"
@@ -47,10 +56,16 @@ PROPERTIES = "org.freedesktop.DBus.Properties"
 
 # AT-SPI role and state numbers (atspi-constants.h).
 MENU, MENU_BAR, POPUP_MENU = 33, 34, 41
+MENU_ROLES = {MENU, POPUP_MENU}
 ITEM_ROLES = {8, 35, 45}  # check menu item, menu item, radio menu item
 CONTROL_ROLES = ITEM_ROLES | {43, 62, 129}  # push button, toggle button, push button menu
 # Page content is not part of the app's own interface, and can be huge.
 CONTENT_ROLES = {60, 82, 92, 93, 94, 95, 96}  # terminal and the document roles
+WEB_PAGE = 95  # document web
+TEXT_ROLES = {29, 83, 116}  # label, heading, static text
+# What a dialog holds and a menu does not: check box, combo box, dialog,
+# password text, radio button, slider, spin button, entry.
+FORM_ROLES = {7, 11, 16, 40, 44, 51, 52, 79}
 ACTIVE, CHECKED, ENABLED, PRESSED, SENSITIVE, SHOWING = 1, 4, 8, 20, 24, 25
 
 MAX_DEPTH = 12
@@ -62,6 +77,16 @@ RUN_TIMEOUT = 2000  # milliseconds
 IDLE_TIMEOUT = 300  # seconds before a forgotten reader exits
 BATCH = 100  # entries per line, so a line stays a few kilobytes
 RUN_DELAY = 60  # milliseconds for the menu to close before an entry runs
+# A page answers a press before it has drawn anything, so a menu is waited
+# for: Obsidian starts one within 25 ms and has it whole within 80.
+LAYER_WAIT = 0.15  # seconds a pressed button has to start drawing its menu
+MENU_WAIT = 0.25  # seconds it has to finish it
+MENU_POLL = 0.01  # seconds between looks for it
+MENU_NODES = 1000
+# Close, Minimize, Maximize and Restore: the most buttons a window has that
+# are its frame's and not its app's.
+FRAME_BUTTONS = 4
+ESCAPE_WAIT = 0.03  # seconds for an app to take a menu down
 
 MODIFIERS = {
     "<Primary>": "Ctrl+",
@@ -111,6 +136,7 @@ class Node:
     name: str = ""
     key: str = ""  # the shortcut, as the toolkit spells it
     actions: int = 0
+    press: str = ""  # what its first action is called
 
     def has(self, state: int) -> bool:
         return bool(self.state >> state & 1)
@@ -129,6 +155,10 @@ class Press:
     """Run by pressing an item or a button of the accessibility tree."""
 
     ref: Ref
+    # The web page it is on, when that page is the app's whole interface. Such
+    # a page draws a menu only once its button is pressed, so pressing may
+    # open one.
+    page: Ref | None = None
 
 
 @dataclass(frozen=True)
@@ -151,10 +181,16 @@ class Entry:
     enabled: bool = True  # False when the app has greyed it out
     checked: bool = False
     why: str = ""  # set when it is listed for information only
+    place: str = ""  # the part of the window it is in, when its label is not the only one
 
     @property
     def runnable(self) -> bool:
         return self.enabled and not self.why
+
+    @property
+    def opens(self) -> bool:
+        """Whether running it may open a menu to read."""
+        return isinstance(self.target, Press) and self.target.page is not None
 
     def message(self) -> dict:
         message = {"id": self.id, "path": self.path, "label": self.label, "key": self.key, "kind": self.kind}
@@ -164,6 +200,10 @@ class Entry:
             message["why"] = self.why
         if self.checked:
             message["on"] = True
+        if self.opens:
+            message["opens"] = True
+        if self.place:
+            message["place"] = self.place
         return message
 
 
@@ -180,12 +220,17 @@ class Entries:
             key: str = "", enabled: bool = True, checked: bool = False, why: str = "") -> None:
         self.all.append(Entry(len(self.all), path, label, kind, target, key, enabled, checked, why))
 
+    def fresh(self) -> list[Entry]:
+        """What was added since the last time."""
+        fresh = self.all[self.sent:]
+        self.sent = len(self.all)
+        return fresh
+
     def flush(self) -> int:
         """Sends what was added since the last time; says how many that was."""
-        fresh = self.all[self.sent:]
+        fresh = self.fresh()
         for start in range(0, len(fresh), BATCH):
             self.emit({"t": "items", "items": [entry.message() for entry in fresh[start:start + BATCH]]})
-        self.sent = len(self.all)
         return len(fresh)
 
 
@@ -224,6 +269,18 @@ def shortcut(binding: str) -> str:
         *held, key = accelerator.split("+")
     held.sort(key=lambda name: MODIFIER_ORDER.index(name) if name in MODIFIER_ORDER else len(MODIFIER_ORDER))
     return "+".join(held + [key.upper() if len(key) == 1 else key.capitalize()])
+
+
+HELD = r"(?:(?:Ctrl|Alt|Shift|Super|Meta|Cmd)\+)"
+CHORD = rf"(?:{HELD}+\S+|F\d{{1,2}})"
+SHORTCUT_AT_END = re.compile(rf"^(.+?) (?:\(({CHORD}(?: {CHORD})*)\)|({HELD}+\S+(?: {CHORD})*))$")
+
+
+def split_shortcut(text: str) -> tuple[str, str]:
+    """("Settings", "Ctrl+,") from "Settings Ctrl+," or "Settings (Ctrl+,)":
+    a page has nowhere but the name to put a shortcut."""
+    found = SHORTCUT_AT_END.match(text)
+    return (found[1], found[2] or found[3]) if found else (text, "")
 
 
 def humanize(action: str) -> str:
@@ -382,17 +439,25 @@ def _key(node: Node, reply: tuple | None) -> None:
         node.key = reply[0]
 
 
+def _press(node: Node, reply: tuple | None) -> None:
+    if reply:
+        node.press = reply[0]
+
+
 class Tree:
     """The accessibility tree of one app."""
 
-    def __init__(self, batch: Batch, qt: bool = False):
+    def __init__(self, batch: Batch, qt: bool = False, chromium: bool = False):
         self.batch = batch
+        # Chromium, and so Electron, keeps its interface to itself unless it
+        # is started with --force-renderer-accessibility.
+        self.chromium = chromium
         # Qt leaves the shortcut out of the action list and gives it only
         # when asked: a second call per node, so not sent to other toolkits.
         self.qt = qt
 
     def fetch(self, refs: list[Ref], *, children: bool = False, role: bool = False, state: bool = False,
-              name: bool = False, actions: bool = False) -> dict[Ref, Node]:
+              name: bool = False, actions: bool = False, press: bool = False) -> dict[Ref, Node]:
         """A node for every ref, with what was asked for, all asked at once."""
         nodes = {ref: Node() for ref in refs}
         call = self.batch.call
@@ -409,6 +474,9 @@ class Tree:
                 call(ref, ACTION, "GetActions", None, partial(_actions, node))
                 if self.qt:
                     call(ref, ACTION, "GetKeyBinding", GLib.Variant("(i)", (0,)), partial(_key, node))
+            if press:
+                # Chromium leaves the names out of the action list too.
+                call(ref, ACTION, "GetName", GLib.Variant("(i)", (0,)), partial(_press, node))
         self.batch.wait()
         return nodes
 
@@ -426,7 +494,7 @@ def app_frames(batch: Batch, pid: int) -> tuple[Tree, dict[Ref, Node]]:
                    lambda reply: toolkits.append(reply[0]) if reply else None)
     batch.wait()
 
-    tree = Tree(batch, qt="Qt" in toolkits)
+    tree = Tree(batch, qt="Qt" in toolkits, chromium="Chromium" in toolkits)
     frames = [frame for node in tree.fetch(own, children=True).values() for frame in node.children]
     log.debug("accessibility: %d app object(s), toolkit %s, %d frame(s)", len(own), toolkits or "?", len(frames))
     return tree, tree.fetch(frames, children=True, role=True, state=True, name=True)
@@ -523,10 +591,76 @@ def read_menu(tree: Tree, menubar: Ref, entries: Entries, deadline: float, why: 
     log.debug("menu bar: %d node(s), %d level(s), %d item(s)", len(nodes), depth, sent)
 
 
+def text_in(nodes: dict[Ref, Node], ref: Ref) -> str:
+    """The first plain text below `ref`; what a control says is its own."""
+    node = nodes.get(ref)
+    if node is None or node.role in CONTROL_ROLES:
+        return ""
+    if node.role in TEXT_ROLES and node.label:
+        return node.label
+    return next(filter(None, (text_in(nodes, child) for child in node.children)), "")
+
+
+def place_buttons(buttons: list[Entry], nodes: dict[Ref, Node], parents: dict[Ref, Ref]) -> None:
+    """Says which part of the window a button is in, where the window has
+    several parts alike: the More options of one pane from that of the next.
+
+    Buttons with one label show where such parts are. The part of each is
+    what it does not share with its namesakes, and is called by the nearest
+    text in it: for a pane, its title. Every other button in that part is
+    placed there too. Parts with one title are numbered in the window's order.
+    """
+    above: dict[int, list[Ref]] = {}
+    for button in buttons:
+        chain, ref = [], parents.get(button.target.ref)
+        while ref is not None:
+            chain.append(ref)
+            ref = parents.get(ref)
+        above[button.id] = chain
+
+    # Buttons are read a level at a time; the window's own order is top-down.
+    order: dict[Ref, int] = {}
+    stack = [ref for ref in nodes if ref not in parents]
+    while stack:
+        ref = stack.pop()
+        if ref not in order:
+            order[ref] = len(order)
+            stack.extend(reversed(nodes[ref].children if ref in nodes else []))
+
+    by_label: dict[str, list[Entry]] = {}
+    for button in sorted(buttons, key=lambda button: order.get(button.target.ref, 0)):
+        by_label.setdefault(button.label, []).append(button)
+    parts: dict[Ref, str] = {}
+    titled: dict[str, int] = {}
+    # The label seen most often shows the most parts, so it names them first.
+    for namesakes in sorted(by_label.values(), key=len, reverse=True):
+        if len(namesakes) < 2:
+            break
+        shared: dict[Ref, int] = {}
+        for button in namesakes:
+            for ref in above[button.id]:
+                shared[ref] = shared.get(ref, 0) + 1
+        for button in namesakes:
+            own = [ref for ref in above[button.id] if shared[ref] == 1]
+            title = next(filter(None, (text_in(nodes, ref) for ref in own)), "")
+            if not title or any(ref in parts for ref in above[button.id]):
+                continue
+            titled[title] = titled.get(title, 0) + 1
+            parts[own[-1]] = title if titled[title] == 1 else f"{title} {titled[title]}"
+
+    for button in buttons:
+        button.place = next((parts[ref] for ref in above[button.id] if ref in parts), "")
+
+
 def read_controls(tree: Tree, frame: Ref, entries: Entries, deadline: float, why: str, content: bool = False) -> int:
     """The window's named buttons; says how many. Page content is left out
     unless asked for."""
     level = [frame]
+    pages: dict[Ref, Ref] = {}  # the web page each node of one is on
+    known = {entry.target.ref for entry in entries.all if isinstance(entry.target, Press)}
+    nodes: dict[Ref, Node] = {}
+    parents: dict[Ref, Ref] = {}
+    first = len(entries.all)
     seen = 0
     for _ in range(30):
         if not level or seen >= MAX_NODES or time.monotonic() > deadline:
@@ -534,6 +668,7 @@ def read_controls(tree: Tree, frame: Ref, entries: Entries, deadline: float, why
         level = level[: MAX_NODES - seen]
         seen += len(level)
         fetched = tree.fetch(level, children=True, role=True, state=True, name=True)
+        nodes.update(fetched)
         controls = [ref for ref in level
                     if fetched[ref].role in CONTROL_ROLES and fetched[ref].label and fetched[ref].has(SHOWING)]
         acting = tree.fetch(controls, actions=True)
@@ -543,17 +678,205 @@ def read_controls(tree: Tree, frame: Ref, entries: Entries, deadline: float, why
             node = fetched[ref]
             if node.role in CONTENT_ROLES and not content:
                 continue
+            page = pages.get(ref) or (ref if node.role == WEB_PAGE else None)
             if ref in acting:
                 node.key, node.actions = acting[ref].key, acting[ref].actions
-                if node.usable:
-                    entries.add([], node.label, "button", Press(ref), key=shortcut(node.key),
+                if node.usable and ref not in known:
+                    label, key = split_shortcut(node.label) if page is not None else (node.label, "")
+                    entries.add([], label, "button", Press(ref, page), key=shortcut(node.key) or key,
                                 checked=node.has(CHECKED) or node.has(PRESSED), why=why)
+            if page is not None:
+                pages.update((child, page) for child in node.children)
+            parents.update((child, ref) for child in node.children)
             below.extend(node.children)
         level = below
 
+    place_buttons(entries.all[first:], nodes, parents)
     found = entries.flush()
     log.debug("buttons%s: %d node(s), %d button(s)", " with page content" if content else "", seen, found)
     return found
+
+
+# --- Menus a page draws when asked ------------------------------------------
+
+
+def takes_click(node: Node) -> bool:
+    # A page calls it "click" on what listens for one itself, and
+    # "clickAncestor" on what merely sits inside such a thing.
+    return node.actions > 0 and (node.role in CONTROL_ROLES or node.press == "click")
+
+
+def text_of(nodes: dict[Ref, Node], ref: Ref) -> str:
+    """Its name, or else the text inside it."""
+    node = nodes.get(ref)
+    if node is None:
+        return ""
+    return node.name or " ".join(filter(None, (text_of(nodes, child) for child in node.children)))
+
+
+def choices(nodes: dict[Ref, Node], ref: Ref) -> Iterator[tuple[Ref, str, Node]]:
+    """What can be chosen below `ref`, in the page's order: the innermost
+    things that take a click, named by the text in them. A page seldom gives
+    its own menus the roles of one, so the roles are not asked."""
+    node = nodes.get(ref)
+    if node is None:
+        return
+    inner = [choice for child in node.children for choice in choices(nodes, child)]
+    if inner:
+        yield from inner
+    elif takes_click(node) and clean(text_of(nodes, ref)):
+        yield ref, clean(text_of(nodes, ref)), node
+
+
+def read_drawn(tree: Tree, roots: list[Ref], deadline: float, menu: bool) -> list[tuple[Ref, str, Node]]:
+    """The choices of what a page has just drawn; none when that is not a
+    menu. `menu` says the page calls it one itself, and is taken at its word."""
+    nodes: dict[Ref, Node] = {}
+    level = roots
+    while level and len(nodes) < MENU_NODES and time.monotonic() < deadline:
+        fetched = tree.fetch(level, children=True, role=True, state=True, name=True, actions=True, press=True)
+        nodes.update(fetched)
+        level = [child for ref in level for child in fetched[ref].children if child not in nodes]
+    found = [choice for root in roots for choice in choices(nodes, root)]
+    if menu:
+        return found
+    if any(node.role in FORM_ROLES for node in nodes.values()):
+        return []
+    # One thing to click is a notice, not a menu.
+    return found if len(found) > 1 else []
+
+
+def walk(tree: Tree, root: Ref, deadline: float) -> tuple[dict[Ref, Node], dict[Ref, Ref]]:
+    """Every node below `root` with its role, and the parent of each."""
+    nodes: dict[Ref, Node] = {}
+    parents: dict[Ref, Ref] = {}
+    level = [root]
+    while level and len(nodes) < MAX_NODES and time.monotonic() < deadline:
+        fetched = tree.fetch(level, children=True, role=True)
+        nodes.update(fetched)
+        below = []
+        for ref in level:
+            for child in fetched[ref].children:
+                if child not in nodes and child not in parents:
+                    parents[child] = ref
+                    below.append(child)
+        level = below
+    return nodes, parents
+
+
+def drawn_menus(nodes: dict[Ref, Node], parents: dict[Ref, Ref], before: set[Ref], page: Ref) -> tuple[list[Ref], bool]:
+    """What a page has drawn since `before` that may be a menu, and whether
+    the page calls it one.
+
+    A page that says what its menus are (VS Code) draws them anywhere, and is
+    believed. One that does not (Obsidian) adds a menu as a new layer over
+    everything else, a child of the page itself: only that is looked at, so a
+    panel that opens somewhere inside the page is not taken for a menu.
+    """
+    fresh = [ref for ref in nodes if ref not in before]
+    menus = {ref for ref in fresh if nodes[ref].role in MENU_ROLES}
+
+    def inside_another(ref: Ref) -> bool:
+        ref = parents.get(ref)
+        while ref is not None and ref not in before:
+            if ref in menus:
+                return True
+            ref = parents.get(ref)
+        return False
+
+    outer = [ref for ref in fresh if ref in menus and not inside_another(ref)]
+    if outer:
+        return outer, True
+    return [ref for ref in fresh if parents.get(ref) == page], False
+
+
+@dataclass
+class Opened:
+    """A menu an app drew because we pressed its button: what was drawn, each
+    with what it was drawn in."""
+
+    drawn: list[tuple[Ref, Ref]]
+
+
+def still_up(tree: Tree, opened: list[Opened]) -> bool:
+    """Whether any of the menus is still drawn."""
+    holders = tree.fetch(list({parent for menu in opened for parent, _ in menu.drawn}), children=True)
+    return any(ref in holders[parent].children for menu in opened for parent, ref in menu.drawn)
+
+
+def open_menu(tree: Tree, entry: Entry, entries: Entries, up: list[Opened]) -> tuple[Opened | None, str]:
+    """Presses the entry and adds the menu that draws, if one does. Gives the
+    menu, or None when the press did something else, and why it failed.
+
+    `up` are the menus already open: once a press has closed them it was a
+    choice in one, and there is no more to wait for.
+    """
+    press: Press = entry.target
+    connection = tree.batch.connection
+    before = set(walk(tree, press.page, time.monotonic() + READ_BUDGET)[0])
+    answer: list[str] = []
+
+    def pressed(connection, result):
+        try:
+            if not connection.call_finish(result).unpack()[0]:
+                answer.append("the app refused that action")
+        except GLib.Error as error:
+            # What opens a dialog may only answer once it is closed.
+            if not error.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT):
+                answer.append(error.message)
+
+    connection.call(press.ref.bus, press.ref.path, ACTION, "DoAction", GLib.Variant("(i)", (0,)),
+                    GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, RUN_TIMEOUT, None, pressed)
+
+    started = time.monotonic()
+    while time.monotonic() < started + MENU_WAIT and not answer:
+        time.sleep(MENU_POLL)
+        if up and not still_up(tree, up):
+            break
+        nodes, parents = walk(tree, press.page, started + MENU_WAIT)
+        roots, menu = drawn_menus(nodes, parents, before, press.page)
+        if not roots:
+            # Nothing like a menu this long after the press: it was a plain button.
+            if time.monotonic() > started + LAYER_WAIT:
+                break
+            continue
+        # A menu still being drawn is read again until it has its items.
+        found = read_drawn(tree, roots, time.monotonic() + MENU_WAIT, menu)
+        if found:
+            for ref, text, node in found:
+                label, key = split_shortcut(text)
+                entries.add(entry.path + [entry.label], label, "menu", Press(ref, press.page), key=key,
+                            enabled=node.usable, checked=node.has(CHECKED), why=entry.why)
+            log.debug("menu of %r: %d part(s), %d item(s), %.0f ms", entry.label, len(roots), len(found),
+                      (time.monotonic() - started) * 1000)
+            return Opened([(parents[ref], ref) for ref in roots]), ""
+    log.debug("%r opened no menu%s", entry.label, f": {answer[0]}" if answer else "")
+    return None, answer[0] if answer else ""
+
+
+def send_escape(address: str) -> None:
+    lua = f"hl.dispatch(hl.dsp.send_shortcut({{ mods = '', key = 'Escape', window = 'address:{address}' }}))"
+    try:
+        subprocess.run(["hyprctl", "eval", lua], capture_output=True, check=False, timeout=3)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log.debug("hyprctl eval failed: %s", error)
+
+
+def close_menus(tree: Tree, address: str, opened: list[Opened]) -> None:
+    """Closes the menus we had the app draw, so it is left as it was found.
+
+    Nothing in the accessibility tree closes a menu, so the window is sent an
+    Escape, as many times as it has menus up. None is sent once they are gone:
+    it would land on the app itself.
+    """
+    if not re.fullmatch(r"0x[0-9a-f]+", address):
+        return
+    for _ in opened:
+        if not still_up(tree, opened):
+            break
+        send_escape(address)
+        time.sleep(ESCAPE_WAIT)
+    opened.clear()
 
 
 # --- GTK actions over D-Bus --------------------------------------------------
@@ -661,14 +984,18 @@ def read(window: dict, session: Gio.DBusConnection, accessibility: Gio.DBusConne
     if tree is not None and found.frame is not None and not has_menu:
         deadline = time.monotonic() + READ_BUDGET
         buttons = read_controls(tree, found.frame, entries, deadline, found.why)
-        # An Electron app draws its whole interface as a web page.
-        if not buttons and not entries.all:
+        # An Electron app draws its whole interface as a web page. Around it
+        # there is nothing, or the buttons of a window frame; a browser has a
+        # toolbar there, and its page is not its own.
+        if (not buttons and not entries.all) or (tree.chromium and buttons <= FRAME_BUTTONS):
             read_controls(tree, found.frame, entries, deadline, found.why, content=True)
 
     if entries.all:
         status = "ok"
+    elif not accessibility_enabled(session):
+        status = "accessibility-off"
     else:
-        status = "empty" if accessibility_enabled(session) else "accessibility-off"
+        status = "needs-flag" if tree is not None and tree.chromium else "empty"
     log.debug("%d entries, %s, %.0f ms", len(entries.all), status, (time.monotonic() - started) * 1000)
     emit({"t": "done", "status": status})
     return entries
@@ -702,46 +1029,84 @@ def run(entry: Entry, session: Gio.DBusConnection, accessibility: Gio.DBusConnec
 
 
 def parse_command(line: str) -> tuple[str, int]:
-    """("run", id), ("accessibility", 0), or ("", 0) for anything else."""
+    """("run", id), ("open", id), ("back", 0), ("accessibility", 0), or
+    ("", 0) for anything else."""
     words = line.split()
-    if len(words) == 2 and words[0] == "run" and words[1].isdigit():
-        return "run", int(words[1])
-    if words == ["accessibility"]:
-        return "accessibility", 0
+    if len(words) == 2 and words[0] in ("run", "open") and words[1].isdigit():
+        return words[0], int(words[1])
+    if words in (["accessibility"], ["back"]):
+        return words[0], 0
     return "", 0
 
 
-def serve(entries: Entries, session: Gio.DBusConnection, accessibility: Gio.DBusConnection | None) -> None:
+def serve(entries: Entries, window: dict, session: Gio.DBusConnection,
+          accessibility: Gio.DBusConnection | None) -> None:
     """Runs the commands SearchMenuItems.qml writes to stdin, until it closes it."""
     loop = GLib.MainLoop()
+    tree = Tree(Batch(accessibility)) if accessibility is not None else None
+    address = str(window.get("address") or "")
+    opened: list[Opened] = []  # the menus the app has up because of us
+    running = False
 
     def run_entry(entry_id: int) -> bool:
         error = run(entries.all[entry_id], session, accessibility) if entry_id < len(entries.all) else "that entry is gone"
+        # A menu goes away with the choice made in it.
+        opened.clear()
         entries.emit({"t": "ran", "error": error})
         loop.quit()
         return False
 
+    def open_entry(entry_id: int) -> bool:
+        """Whether a menu opened; the entry has run all the same when not."""
+        entry = entries.all[entry_id] if entry_id < len(entries.all) else None
+        if entry is None or tree is None or not entry.opens or not entry.runnable:
+            entries.emit({"t": "pressed", "error": "that entry is not available"})
+            return False
+        menu, error = open_menu(tree, entry, entries, opened)
+        if menu is None:
+            entries.emit({"t": "pressed", "error": error})
+            return False
+        opened.append(menu)
+        entries.emit({"t": "menu", "path": entry.path + [entry.label],
+                      "items": [item.message() for item in entries.fresh()]})
+        return True
+
+    def stopped() -> bool:
+        # The menu closes as it asks for a run, and stops us with it: that
+        # must not lose the run.
+        if not running:
+            loop.quit()
+        return True
+
     def command(_source, condition) -> bool:
+        nonlocal running
         line = sys.stdin.readline() if condition & GLib.IOCondition.IN else ""
         if not line:
             loop.quit()
             return False
         name, entry_id = parse_command(line)
         if name == "run":
-            # The menu closes as it asks; being stopped with it must not lose
-            # the run. It waits a moment, so the app has the focus back.
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            # It waits a moment, so the app has the focus back.
+            running = True
             GLib.timeout_add(RUN_DELAY, run_entry, entry_id)
             return False
+        if name == "open" and not open_entry(entry_id):
+            loop.quit()
+            return False
+        if name == "back" and tree is not None:
+            close_menus(tree, address, opened)
         if name == "accessibility":
             enable_accessibility()
             entries.emit({"t": "accessibility", "on": accessibility_enabled(session)})
         return True
 
+    unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stopped)
     GLib.io_add_watch(sys.stdin.fileno(), GLib.PRIORITY_DEFAULT,
                       GLib.IOCondition.IN | GLib.IOCondition.HUP, command)
     GLib.timeout_add_seconds(IDLE_TIMEOUT, loop.quit)
     loop.run()
+    if tree is not None:
+        close_menus(tree, address, opened)
 
 
 def print_entries(entries: Entries) -> None:
@@ -775,7 +1140,7 @@ def main() -> int:
         return 0
 
     to_stdout({"t": "window", "class": window.get("class") or "", "title": window.get("title") or ""})
-    serve(read(window, session, accessibility, to_stdout), session, accessibility)
+    serve(read(window, session, accessibility, to_stdout), window, session, accessibility)
     return 0
 
 

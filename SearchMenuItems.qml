@@ -23,9 +23,13 @@ Item {
   property var prefix: []           // the menu we are in: ["File", "Export As"]
   property var rows: []
   property int selectedIndex: 0
-  property string status: "reading" // reading | ok | empty | accessibility-off | accessibility-on | no-window
+  property string status: "reading" // reading | ok | empty | needs-flag | accessibility-off | accessibility-on | no-window
   property string windowClass: ""
   property int pendingRun: -1       // entry the reader is running, so closing does not stop it
+  property int opening: -1          // entry the reader is pressing, to see whether it opens a menu
+  // A menu the app drew when its button was pressed: the entry that opened
+  // it, how deep that entry is, and the first of the entries the menu added.
+  property var appMenu: null
   property bool restart: false      // a reader is still stopping; start the next when it has
   property string mode: "menu"      // "menu", or "hotkey" to choose the key that opens it
   property string bindsJson: ""     // `hyprctl binds -j`, to tell free keys from taken ones
@@ -77,6 +81,7 @@ Item {
     if (status === "no-window") return "No window is focused."
     if (status === "accessibility-on") return "Accessibility support is on. Restart " + appName + " so it publishes its menu."
     if (input.text.trim() !== "") return "Nothing matches “" + input.text.trim() + "”."
+    if (status === "needs-flag") return appName + " only publishes its buttons when it is started with --force-renderer-accessibility."
     return appName + " publishes no menu or buttons."
   }
 
@@ -99,6 +104,9 @@ Item {
     root.status = "reading"
     root.windowClass = ""
     root.pendingRun = -1
+    root.opening = -1
+    root.appMenu = null
+    openGuard.stop()
     root.selectedIndex = 0
     root.lastPointer = Qt.point(-1, -1)
     input.text = typeof payload.query === "string" ? payload.query : ""
@@ -175,6 +183,22 @@ Item {
     } else if (message.t === "accessibility") {
       root.status = message.on ? "accessibility-on" : "empty"
       root.recompute()
+    } else if (message.t === "menu") {
+      // The button opened a menu in the app: it is stepped into like any other.
+      var items = message.items || []
+      if (!root.appMenu && items.length > 0) {
+        root.appMenu = { opener: root.opening, depth: message.path.length - 1, from: items[0].id }
+      }
+      root.opening = -1
+      openGuard.stop()
+      root.entries = root.entries.concat(items)
+      root.enter(message.path)
+    } else if (message.t === "pressed") {
+      // It opened none, so pressing it was all there was to do.
+      if (message.error) Quickshell.execDetached(["notify-send", "-a", "Search Menu Items", "Search Menu Items", "Could not run that: " + message.error])
+      root.opening = -1
+      openGuard.stop()
+      root.dismiss()
     } else if (message.t === "ran") {
       if (message.error) Quickshell.execDetached(["notify-send", "-a", "Search Menu Items", "Search Menu Items", "Could not run that: " + message.error])
       root.pendingRun = -1
@@ -197,6 +221,14 @@ Item {
     id: runGuard
     interval: 5000
     onTriggered: { root.pendingRun = -1; reader.running = false }
+  }
+
+  // A button that may open a menu is pressed with this menu still up, and
+  // the reader says at once which it was. This is for a reader that does not.
+  Timer {
+    id: openGuard
+    interval: 2000
+    onTriggered: { root.opening = -1; root.dismiss() }
   }
 
   // ---------------------------------------------------------------- rows
@@ -263,8 +295,15 @@ Item {
     var left = root.prefix[root.prefix.length - 1]
     root.prefix = root.prefix.slice(0, -1)
     input.text = ""
+    // Out of a menu the app drew: the app closes it, and its entries go.
+    var closed = root.appMenu && root.prefix.length <= root.appMenu.depth ? root.appMenu : null
+    if (closed) {
+      root.appMenu = null
+      root.entries = root.entries.filter(function(entry) { return entry.id < closed.from })
+      if (reader.running) reader.write("back\n")
+    }
     root.recompute()
-    root.selectedIndex = Model.indexOfSection(root.rows, left)
+    root.selectedIndex = closed ? Model.indexOfItem(root.rows, closed.opener) : Model.indexOfSection(root.rows, left)
     list.positionViewAtIndex(root.selectedIndex, ListView.Contain)
     return true
   }
@@ -279,7 +318,13 @@ Item {
     } else if (row.type === "enable") {
       if (reader.running) reader.write("accessibility\n")
     } else if (!row.off) {
-      if (!reader.running) return
+      if (!reader.running || root.opening >= 0) return
+      if (row.opens) {
+        root.opening = row.id
+        reader.write("open " + row.id + "\n")
+        openGuard.restart()
+        return
+      }
       root.pendingRun = row.id
       reader.write("run " + row.id + "\n")
       runGuard.restart()
@@ -497,7 +542,9 @@ Item {
             anchors.rightMargin: Style.space(4)
             anchors.verticalCenter: parent.verticalCenter
             visible: root.entries.length > 0
-            text: input.text.trim() ? root.rows.length + " of " + root.entries.length : String(root.entries.length)
+            // Of the menu we are in, not of the whole app.
+            readonly property int total: Model.count(root.entries, root.prefix)
+            text: input.text.trim() ? root.rows.length + " of " + total : String(total)
             color: root.foreground
             opacity: 0.4 * root.counts
             font.family: root.fontFamily

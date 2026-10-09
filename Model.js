@@ -4,9 +4,9 @@
 // Pure: entries in, rows out, so it runs under node in tests/run.js.
 //
 // An entry is what bin/search-menu-items sends:
-//   { id, path: ["File", "Export As"], label, key, kind, off, on, why }
+//   { id, path: ["File", "Export As"], label, key, kind, off, on, why, opens, place }
 // A row is what SearchMenuItems.qml draws:
-//   { type: "section" | "item", label, where, key, off, on, id, target, count }
+//   { type: "section" | "item", label, where, key, off, on, opens, id, target, count }
 
 var SEPARATOR = " › "
 var LIMIT = 300
@@ -31,8 +31,9 @@ function sectionRow(prefix, name, where, count) {
 }
 
 function itemRow(entry, where) {
-  return { type: "item", label: entry.label, where: where, key: entry.key || "", kind: entry.kind,
-           off: !!entry.off, on: !!entry.on, why: entry.why || "", id: entry.id }
+  // A button that shares its label says which part of the window it is in.
+  return { type: "item", label: entry.label, where: where || entry.place || "", key: entry.key || "", kind: entry.kind,
+           off: !!entry.off, on: !!entry.on, opens: !!entry.opens, why: entry.why || "", id: entry.id }
 }
 
 // One level of the menu, in the app's own order: sub-menus and items mixed
@@ -101,7 +102,7 @@ function search(entries, prefix, query) {
       if (s >= 0) found.push({ score: s - 0.5, order: found.length, row: row })
     }
 
-    var points = score(fold(entry.label), fold(inner.join(" ")), needle, words)
+    var points = score(fold(entry.label), fold(inner.concat([entry.place || ""]).join(" ")), needle, words)
     if (points < 0) continue
     found.push({ score: points + (entry.off ? 0.25 : 0), order: found.length, row: itemRow(entry, inner.join(SEPARATOR)) })
   }
@@ -114,6 +115,13 @@ function rows(entries, sections, prefix, query) {
   return terms(query).length > 0 ? search(entries, prefix, query) : browse(entries, sections, prefix)
 }
 
+// How many entries the menu at `prefix` holds, sub-menus included.
+function count(entries, prefix) {
+  var found = 0
+  for (var i = 0; i < entries.length; i++) if (startsWith(entries[i].path, prefix)) found++
+  return found
+}
+
 // Where the row for `name` sits, so going back up lands on the section left.
 function indexOfSection(rowList, name) {
   for (var i = 0; i < rowList.length; i++) {
@@ -122,10 +130,22 @@ function indexOfSection(rowList, name) {
   return 0
 }
 
-// "Ctrl+Shift+S" -> ["Ctrl", "Shift", "S"], keeping a "+" key.
+// Where the row for the entry sits, so closing the menu it opened lands on it.
+function indexOfItem(rowList, id) {
+  for (var i = 0; i < rowList.length; i++) {
+    if (rowList[i].type === "item" && rowList[i].id === id) return i
+  }
+  return 0
+}
+
+// "Ctrl+Shift+S" -> ["Ctrl", "Shift", "S"], keeping a "+" key. Keys pressed
+// one after another, "Ctrl+K Ctrl+S", come as one row of them.
 function keys(shortcut) {
   var text = String(shortcut || "")
   if (!text) return []
+  if (text.indexOf(" ") > 0) {
+    return text.split(" ").reduce(function(all, chord) { return all.concat(keys(chord)) }, [])
+  }
   if (text === "+") return ["+"]
   if (text.slice(-2) === "++") return text.slice(0, -2).split("+").concat(["+"])
   return text.split("+")

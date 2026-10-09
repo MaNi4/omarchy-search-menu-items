@@ -7,7 +7,7 @@ const library = (file, names) => {
   const source = fs.readFileSync(path.join(__dirname, "..", file), "utf8").replace(/^\.pragma library\s*$/m, "")
   return new Function(source + "\nreturn { " + names + " }")()
 }
-const Model = library("Model.js", "rows, browse, search, keys, indexOfSection, terms")
+const Model = library("Model.js", "rows, browse, search, keys, count, indexOfSection, indexOfItem, terms")
 const Hotkey = library("Hotkey.js", "parse, format, tidy, holder, plan, choices, IDEAS, DESCRIPTION")
 
 // What `hyprctl binds -j` reports: SUPER is 64, ALT 8, SHIFT 1.
@@ -83,13 +83,45 @@ const tests = {
   "nothing matches nonsense"() {
     assert.deepStrictEqual(Model.rows(entries, [], [], "zzz"), [])
   },
+  "a menu counts what is in it, sub-menus included"() {
+    assert.strictEqual(Model.count(entries, []), entries.length)
+    assert.strictEqual(Model.count(entries, ["File"]), 5)
+    assert.strictEqual(Model.count(entries, ["File", "New"]), 2)
+    assert.strictEqual(Model.count(entries, ["Nowhere"]), 0)
+  },
   "going back up lands on the section left"() {
     assert.strictEqual(Model.indexOfSection(Model.rows(entries, [], [], ""), "Help"), 4)
+  },
+  "a button that may open a menu says so on its row"() {
+    const button = entry([], "More options", { kind: "button", opens: true })
+    const rows = Model.rows(entries.concat([button]), [], [], "")
+    assert.strictEqual(rows[rows.length - 1].opens, true)
+    assert.strictEqual(rows[rows.length - 2].opens, false)
+  },
+  "buttons with one label say where they are, and are found by it"() {
+    const panes = [entry([], "More options", { kind: "button", place: "Welcome" }),
+                   entry([], "More options", { kind: "button", place: "Graph view" })]
+    assert.deepStrictEqual(Model.rows(panes, [], [], "").map(row => row.where), ["Welcome", "Graph view"])
+    const found = Model.rows(panes, [], [], "graph more")
+    assert.deepStrictEqual(found.map(row => row.id), [panes[1].id])
+    assert.strictEqual(found[0].where, "Graph view")
+  },
+  "the menu a button opened is stepped into like any other"() {
+    const button = entry([], "More options", { kind: "button", opens: true })
+    const inside = [entry(["More options"], "Split right"), entry(["More options"], "Rename...")]
+    assert.deepStrictEqual(labels(Model.rows([button].concat(inside), [], ["More options"], "")), ["Split right", "Rename..."])
+    assert.deepStrictEqual(labels(Model.rows([button].concat(inside), [], ["More options"], "ren")), ["Rename..."])
+  },
+  "closing the menu a button opened lands on the button"() {
+    const rows = Model.rows(entries, [], [], "")
+    assert.strictEqual(Model.indexOfItem(rows, rows[5].id), 5)
+    assert.strictEqual(Model.indexOfItem(rows, -1), 0)
   },
   "a shortcut splits into keys, keeping a plus key"() {
     assert.deepStrictEqual(Model.keys("Ctrl+Shift+S"), ["Ctrl", "Shift", "S"])
     assert.deepStrictEqual(Model.keys("Ctrl++"), ["Ctrl", "+"])
     assert.deepStrictEqual(Model.keys("F1"), ["F1"])
+    assert.deepStrictEqual(Model.keys("Ctrl+K Ctrl+S"), ["Ctrl", "K", "Ctrl", "S"])
     assert.deepStrictEqual(Model.keys(""), [])
   },
 }
