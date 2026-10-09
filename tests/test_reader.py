@@ -398,6 +398,75 @@ class ClosingMenus(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+class TheFlag(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = self.folder.name + "/apps/code-flags.conf"
+
+    def lines(self):
+        return Path(self.path).read_text().splitlines()
+
+    def test_it_is_added_to_a_file_that_is_not_there(self):
+        self.assertFalse(reader.has_flag(self.path))
+        self.assertTrue(reader.add_flag(self.path))
+        self.assertEqual(self.lines(), [reader.ACCESSIBILITY_FLAG])
+        self.assertTrue(reader.has_flag(self.path))
+
+    def test_what_the_file_holds_is_kept(self):
+        Path(self.path).parent.mkdir()
+        Path(self.path).write_text("# mine\n--ozone-platform=wayland")
+        reader.add_flag(self.path)
+        self.assertEqual(self.lines(), ["# mine", "--ozone-platform=wayland", reader.ACCESSIBILITY_FLAG])
+
+    def test_it_is_not_added_twice(self):
+        reader.add_flag(self.path)
+        reader.add_flag(self.path)
+        self.assertEqual(self.lines(), [reader.ACCESSIBILITY_FLAG])
+
+    def test_a_file_that_cannot_be_written_says_so(self):
+        self.assertFalse(reader.add_flag("/proc/nowhere/flags.conf"))
+
+    def test_a_program_no_launcher_is_known_for_is_not_set_up(self):
+        import os
+        self.assertIsNone(reader.launcher_of(os.getpid()))
+        self.assertFalse(reader.flag_set(os.getpid()))
+
+    def setting(self, before):
+        path = self.folder.name + "/settings.json"
+        if before is not None:
+            Path(path).write_text(before)
+        done = reader.set_setting(path, "editor.accessibilitySupport", "off")
+        return done, Path(path).read_text()
+
+    def test_a_setting_goes_into_a_file_that_is_not_there(self):
+        self.assertEqual(self.setting(None), (True, '{\n  "editor.accessibilitySupport": "off"\n}\n'))
+
+    def test_a_setting_goes_in_front_of_the_others_which_stay_as_they_are(self):
+        before = '{ "workbench.colorTheme": "Gruvbox",\n  "update.mode": "none"\n}\n'
+        self.assertEqual(self.setting(before),
+                         (True, '{\n  "editor.accessibilitySupport": "off", "workbench.colorTheme": "Gruvbox",\n'
+                                '  "update.mode": "none"\n}\n'))
+
+    def test_comments_before_the_brace_and_an_empty_file_of_settings(self):
+        self.assertEqual(self.setting("// mine\n{\n  // none yet\n}\n"),
+                         (True, '// mine\n{\n  "editor.accessibilitySupport": "off"\n  // none yet\n}\n'))
+        self.assertEqual(self.setting("{}"), (True, '{\n  "editor.accessibilitySupport": "off"}'))
+
+    def test_a_setting_someone_chose_is_left_alone(self):
+        before = '{ "editor.accessibilitySupport": "on" }'
+        self.assertEqual(self.setting(before), (True, before))
+
+    def test_a_file_that_is_no_settings_is_left_alone(self):
+        self.assertEqual(self.setting("[1, 2]"), (False, "[1, 2]"))
+
+    def test_what_is_written_is_still_settings(self):
+        import json
+        for before in (None, "{}", '{ "a": 1 }', '{\n  "a": 1,\n  "b": [2]\n}'):
+            self.assertEqual(json.loads(self.setting(before)[1])["editor.accessibilitySupport"], "off")
+
+
 class GtkActions(unittest.TestCase):
     def test_action_root(self):
         self.assertEqual(reader.action_root("org.gnome.Nautilus"), "/org/gnome/Nautilus")
@@ -552,6 +621,7 @@ class EntriesAndRunning(unittest.TestCase):
         self.assertEqual(reader.parse_command("accessibility\n"), ("accessibility", 0))
         self.assertEqual(reader.parse_command("open 3\n"), ("open", 3))
         self.assertEqual(reader.parse_command("back\n"), ("back", 0))
+        self.assertEqual(reader.parse_command("flag\n"), ("flag", 0))
         for junk in ("", "run", "run x", "run 1 2", "run -1", "quit", "open", "open x", "back 1"):
             self.assertEqual(reader.parse_command(junk), ("", 0))
 

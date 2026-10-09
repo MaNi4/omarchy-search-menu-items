@@ -26,12 +26,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ElementTree
+from pathlib import Path
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable, Iterator, NamedTuple
@@ -98,6 +100,8 @@ MODIFIERS = {
     "<Meta>": "Meta+",
 }
 MODIFIER_ORDER = ["Super", "Meta", "Ctrl", "Alt", "Shift"]
+
+ACCESSIBILITY_FLAG = "--force-renderer-accessibility"
 
 EXPECTED_ERRORS = {
     "org.freedesktop.DBus.Error.UnknownMethod",
@@ -387,6 +391,111 @@ def enable_accessibility() -> None:
          "org.a11y.Status", "IsEnabled", "b", "true"],
         capture_output=True, check=False,
     )
+
+
+# --- The flag a Chromium app needs -------------------------------------------
+
+
+class Launcher(NamedTuple):
+    """How an Arch package starts a Chromium app: the program that runs, the
+    script that starts it, and the file of flags that script reads."""
+
+    program: str  # a pattern for /proc/<pid>/exe
+    script: str
+    flags: str  # in ~/.config
+    # A setting to add to the app's own settings with the flag: where, in
+    # ~/.config, its name and its value.
+    setting: tuple[str, str, str] | None = None
+    note: str = ""
+
+
+LAUNCHERS = [
+    Launcher(r"/usr/lib/(electron\d*)/electron", r"/usr/bin/\1", "electron-flags.conf"),
+    # With the flag VS Code takes a screen reader to be running, and changes
+    # how its editor behaves unless it is told there is none.
+    Launcher(r"/usr/share/code/code|/opt/visual-studio-code/code", "/usr/bin/code", "code-flags.conf",
+             ("Code/User/settings.json", "editor.accessibilitySupport", "off"),
+             "Also keeps its screen reader mode off, in its settings."),
+    Launcher(r"/usr/lib/chromium/chromium", "/usr/bin/chromium", "chromium-flags.conf"),
+]
+
+
+def config_path(name: str) -> str:
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), name)
+
+
+def flag_set(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as file:
+            return ACCESSIBILITY_FLAG.encode() in file.read().split(b"\0")
+    except OSError:
+        return False
+
+
+def launcher_of(pid: int) -> Launcher | None:
+    """How the app was started, when that is one of the ways known."""
+    try:
+        program = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    for launcher in LAUNCHERS:
+        found = re.fullmatch(launcher.program, program)
+        if found and os.path.exists(found.expand(launcher.script)):
+            return launcher
+    return None
+
+
+def set_setting(path: str, name: str, value: str) -> bool:
+    """Adds a setting to a settings file of VS Code, unless the file says
+    something about it already. The file may hold comments, so it is not
+    written anew: the setting goes in after the opening brace."""
+    try:
+        text = Path(path).read_text() if os.path.exists(path) else ""
+        if f'"{name}"' in text:
+            return True
+        blank = r"(?:\s|//[^\n]*\n|/\*.*?\*/)*"
+        opening = re.match(blank + r"\{", text, re.S)
+        setting = f"\n  {json.dumps(name)}: {json.dumps(value)}"
+        if opening:
+            rest = text[opening.end():]
+            text = text[:opening.end()] + setting + ("" if re.match(blank + r"\}", rest, re.S) else ",") + rest
+        elif not text.strip():
+            text = "{" + setting + "\n}\n"
+        else:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Path(path).write_text(text)
+        return True
+    except OSError as error:
+        log.debug("could not write %s: %s", path, error)
+        return False
+
+
+def set_up(launcher: Launcher) -> bool:
+    """Has the app start with the flag from now on."""
+    if not add_flag(config_path(launcher.flags)):
+        return False
+    return launcher.setting is None or set_setting(config_path(launcher.setting[0]), *launcher.setting[1:])
+
+
+def has_flag(path: str) -> bool:
+    try:
+        return ACCESSIBILITY_FLAG in (line.strip() for line in Path(path).read_text().splitlines())
+    except OSError:
+        return False
+
+
+def add_flag(path: str) -> bool:
+    """Adds the flag to the file, on a line of its own, unless it is there."""
+    try:
+        lines = Path(path).read_text().splitlines() if os.path.exists(path) else []
+        if not has_flag(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            Path(path).write_text("\n".join(lines + [ACCESSIBILITY_FLAG]) + "\n")
+        return True
+    except OSError as error:
+        log.debug("could not write %s: %s", path, error)
+        return False
 
 
 def owners(batch: Batch, names: list[str], pid: int) -> list[str]:
@@ -995,9 +1104,16 @@ def read(window: dict, session: Gio.DBusConnection, accessibility: Gio.DBusConne
     elif not accessibility_enabled(session):
         status = "accessibility-off"
     else:
-        status = "needs-flag" if tree is not None and tree.chromium else "empty"
+        status = "needs-flag" if tree is not None and tree.chromium and not flag_set(pid) else "empty"
     log.debug("%d entries, %s, %.0f ms", len(entries.all), status, (time.monotonic() - started) * 1000)
-    emit({"t": "done", "status": status})
+    done = {"t": "done", "status": status}
+    launcher = launcher_of(pid) if status == "needs-flag" else None
+    if launcher is not None:
+        # The menu offers to set the flag there; once it is, the app only
+        # has to be started again.
+        path = config_path(launcher.flags)
+        done.update(file=path.replace(os.path.expanduser("~"), "~", 1), note=launcher.note, set=has_flag(path))
+    emit(done)
     return entries
 
 
@@ -1029,12 +1145,12 @@ def run(entry: Entry, session: Gio.DBusConnection, accessibility: Gio.DBusConnec
 
 
 def parse_command(line: str) -> tuple[str, int]:
-    """("run", id), ("open", id), ("back", 0), ("accessibility", 0), or
-    ("", 0) for anything else."""
+    """("run", id), ("open", id), ("back", 0), ("accessibility", 0),
+    ("flag", 0), or ("", 0) for anything else."""
     words = line.split()
     if len(words) == 2 and words[0] in ("run", "open") and words[1].isdigit():
         return words[0], int(words[1])
-    if words in (["accessibility"], ["back"]):
+    if words in (["accessibility"], ["back"], ["flag"]):
         return words[0], 0
     return "", 0
 
@@ -1098,6 +1214,9 @@ def serve(entries: Entries, window: dict, session: Gio.DBusConnection,
         if name == "accessibility":
             enable_accessibility()
             entries.emit({"t": "accessibility", "on": accessibility_enabled(session)})
+        if name == "flag":
+            launcher = launcher_of(window.get("pid") or 0)
+            entries.emit({"t": "flag", "on": launcher is not None and set_up(launcher)})
         return True
 
     unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stopped)

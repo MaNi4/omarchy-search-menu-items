@@ -23,6 +23,9 @@ omarchy plugin add https://github.com/MaNi4/omarchy-search-menu-items --enable
 The plugin depends on `python-gobject` and `at-spi2-core`. Both are part of a
 standard Omarchy install.
 
+After updating the plugin, run `omarchy restart shell` so the running shell
+loads the new version.
+
 ## Usage
 
 | Key | Action |
@@ -90,7 +93,7 @@ The plugin can only show what an app makes available, so results vary:
 | Apps with a menu bar, including LibreOffice, Kdenlive, Xournal++ and most GTK 3 and Qt apps | The full menu bar, with shortcuts |
 | GTK 4 apps without a menu bar, such as Files and Ghostty | App actions (New Tab, Preferences and so on) and the window's buttons |
 | Other apps without a menu bar, such as Pinta and Firefox-based browsers | The window's buttons |
-| Chromium and Electron apps, such as Obsidian and VS Code | Nothing by default. If the app is started with a flag (see below), the buttons of the interface, and the menus they open, with shortcuts where the app shows them |
+| Chromium and Electron apps, such as Obsidian and VS Code | The buttons of the interface and the menus they open, with shortcuts where the app shows them, once the app is set up (see below) |
 
 ### Accessibility support
 
@@ -112,31 +115,56 @@ are already running have to be restarted before their menus appear.
 - **Windows with identical titles.** If two windows of the same app have the
   same title, for example two Files windows showing the same folder, the plugin
   cannot tell which one is focused. Their items are listed but dimmed.
-- **Chromium and Electron apps.** Started the usual way, these expose nothing,
-  so the menu is empty. They have no menu bar on Linux, and their menus are
-  drawn only when opened, so there is nothing to read in advance. Starting
-  them with `--force-renderer-accessibility` makes the buttons of their
-  interface available, for example New Tab, Reload and Extensions in
-  Chromium. To set the flag permanently, add it
-  on its own line to `~/.config/chromium-flags.conf` for Chromium, to
-  `~/.config/obsidian/user-flags.conf` for Obsidian installed from the Arch
-  package, or to `~/.config/code-flags.conf` for VS Code installed from
-  `visual-studio-code-bin`, and restart the app. The menu says so when an app
-  of this kind shows nothing.
-
-  In these apps a menu such as More options in Obsidian, or File in VS Code,
-  only exists once its button is pressed. Choose the button and the plugin
-  opens the menu in the app and lets you step into it, sub-menus included.
-  Going back closes it again, by sending the window an Escape key. Its items
-  are not part of a search before that. A button that opens a dialog or
-  nothing at all is simply run. Shortcuts are shown where the app writes them
-  next to an item, as VS Code does.
-
-  VS Code turns on its screen reader mode with the flag; set
-  `"editor.accessibilitySupport": "off"` to keep the editor as it was.
+- **Chromium and Electron apps** need to be set up once, and their menus can
+  only be read by opening them. See the next section.
 
 The bottom line of the menu explains why a dimmed item cannot be run when the
 reason is one of the above.
+
+### Chromium and Electron apps
+
+Started the usual way these apps expose nothing, so the menu is empty. They
+only describe their interface when started with the flag
+`--force-renderer-accessibility`.
+
+**Setting an app up.** You do not have to do this by hand. When such an app
+shows nothing, the menu says so and offers to set it up. Press Enter, then
+close the app completely and start it again. The flag is added to the file the
+app's launcher reads:
+
+| App, installed from the Arch package | File |
+|---|---|
+| Electron apps that run on the system Electron, such as Obsidian | `~/.config/electron-flags.conf` |
+| VS Code (`visual-studio-code-bin`) | `~/.config/code-flags.conf` |
+| Chromium | `~/.config/chromium-flags.conf` |
+
+Nothing outside your own `~/.config` is changed. An update of the app leaves
+the file in place; should the flag ever be lost, the menu offers it again.
+`electron-flags.conf` applies to every app that runs on the system Electron,
+not only the one you confirmed it for.
+
+With the flag VS Code would switch to its screen reader mode. For VS Code the
+same Enter therefore also adds `"editor.accessibilitySupport": "off"` to
+`~/.config/Code/User/settings.json`, unless that setting is already there.
+
+For an app installed another way, such as a Flatpak or an AppImage, the plugin
+does not know where its flags go. The menu then names the flag, and you have
+to add it to the way you start the app yourself.
+
+**Menus.** A menu such as More options in Obsidian, or File in VS Code, only
+exists once its button is pressed. Choose the button and the plugin opens the
+menu in the app and lets you step into it, sub-menus included. Going back
+closes it again, by sending the window an Escape key. Its items are not part
+of a search before that. A button that opens a dialog or nothing at all is
+simply run, and the plugin closes a moment later than for other apps, because
+it first has to see that no menu appeared.
+
+**Tested with.** Obsidian 1.14 and VS Code 1.140, both from the Arch
+packages: buttons, menus, sub-menus (VS Code) and the titles of panes
+(Obsidian). Setting an app up from the menu was tested with VS Code. Other
+Electron apps may draw their menus in a way the plugin does not recognise; a
+button then just runs, as it did before. Web apps opened by Chromium list their
+buttons, but their menus have not been tried.
 
 ## Uninstall
 
@@ -145,8 +173,11 @@ omarchy plugin remove mani4.search-menu-items
 rm -f ~/.config/omarchy/extensions/search-menu-items.json
 ```
 
-The shortcut is removed together with the plugin. If you enabled accessibility
-support through the plugin and want to turn it off again:
+The shortcut is removed together with the plugin. If you let the plugin set up
+a Chromium or Electron app, remove the line `--force-renderer-accessibility`
+from the file listed for it above, and for VS Code the line
+`"editor.accessibilitySupport": "off"` from its settings. If you enabled
+accessibility support through the plugin and want to turn it off again:
 
 ```bash
 gsettings set org.gnome.desktop.interface toolkit-accessibility false

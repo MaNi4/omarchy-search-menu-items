@@ -23,7 +23,21 @@ Item {
   property var prefix: []           // the menu we are in: ["File", "Export As"]
   property var rows: []
   property int selectedIndex: 0
-  property string status: "reading" // reading | ok | empty | needs-flag | accessibility-off | accessibility-on | no-window
+  property string status: "reading" // reading | ok | empty | needs-flag | flag-on | accessibility-off | accessibility-on | no-window
+  property string flagFile: ""      // where the flag a Chromium app needs can be set for it
+  property string flagNote: ""      // what to know about setting it
+  // What a row that sets something up does, said in full below it.
+  readonly property string explain: {
+    var row = rows.length === 1 ? rows[0] : null
+    if (row && row.type === "flag") {
+      return "Adds a start-up flag to " + flagFile + ". Restart " + appName + " afterwards."
+        + (flagNote ? "\n" + flagNote : "")
+    }
+    if (row && row.type === "enable") {
+      return "Turns on the desktop setting toolkit-accessibility. Restart " + appName + " afterwards."
+    }
+    return ""
+  }
   property string windowClass: ""
   property int pendingRun: -1       // entry the reader is running, so closing does not stop it
   property int opening: -1          // entry the reader is pressing, to see whether it opens a menu
@@ -80,6 +94,7 @@ Item {
     if (status === "reading") return "Reading the menu…"
     if (status === "no-window") return "No window is focused."
     if (status === "accessibility-on") return "Accessibility support is on. Restart " + appName + " so it publishes its menu."
+    if (status === "flag-on") return "Done. Restart " + appName + " to see its buttons and menus here."
     if (input.text.trim() !== "") return "Nothing matches “" + input.text.trim() + "”."
     if (status === "needs-flag") return appName + " only publishes its buttons when it is started with --force-renderer-accessibility."
     return appName + " publishes no menu or buttons."
@@ -176,12 +191,19 @@ Item {
     } else if (message.t === "done") {
       root.entries = root.incoming
       root.incoming = []
-      root.status = message.status
+      root.flagFile = message.file || ""
+      root.flagNote = message.note || ""
+      // The flag is in the file already: the app was not started since.
+      root.status = message.status === "needs-flag" && message.set ? "flag-on" : message.status
       root.recompute()
       root.ready = true
       root.counts = 1
     } else if (message.t === "accessibility") {
       root.status = message.on ? "accessibility-on" : "empty"
+      root.recompute()
+    } else if (message.t === "flag") {
+      root.status = message.on ? "flag-on" : "needs-flag"
+      if (!message.on) root.flagFile = ""
       root.recompute()
     } else if (message.t === "menu") {
       // The button opened a menu in the app: it is stepped into like any other.
@@ -272,6 +294,9 @@ Item {
     if (next.length === 0 && root.status === "accessibility-off" && input.text.trim() === "") {
       next = [{ type: "enable", label: "Turn on accessibility support", where: "Apps publish their menus once it is on", key: "" }]
     }
+    if (next.length === 0 && root.status === "needs-flag" && root.flagFile && input.text.trim() === "") {
+      next = [{ type: "flag", label: "Let " + root.appName + " list its buttons and menus", where: "", key: "" }]
+    }
     root.rows = next
     if (root.selectedIndex >= next.length) root.selectedIndex = Math.max(0, next.length - 1)
   }
@@ -317,6 +342,8 @@ Item {
       if (!row.off) root.saveHotkey(row.label)
     } else if (row.type === "enable") {
       if (reader.running) reader.write("accessibility\n")
+    } else if (row.type === "flag") {
+      if (reader.running) reader.write("flag\n")
     } else if (!row.off) {
       if (!reader.running || root.opening >= 0) return
       if (row.opens) {
@@ -696,11 +723,11 @@ Item {
         Text {
           width: parent.width
           height: root.rowHeight * 2
-          visible: root.rows.length === 0
+          visible: root.rows.length === 0 || root.explain !== ""
           horizontalAlignment: Text.AlignHCenter
           verticalAlignment: Text.AlignVCenter
           wrapMode: Text.WordWrap
-          text: root.message
+          text: root.rows.length === 0 ? root.message : root.explain
           color: root.foreground
           opacity: 0.55
           font.family: root.fontFamily
