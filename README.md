@@ -23,8 +23,9 @@ omarchy plugin add https://github.com/MaNi4/omarchy-search-menu-items --enable
 The plugin depends on `python-gobject` and `at-spi2-core`. Both are part of a
 standard Omarchy install.
 
-After updating the plugin, run `omarchy restart shell` so the running shell
-loads the new version.
+Omarchy reloads a plugin when it is updated, but the running shell may keep
+the previous version of its interface. If the menu behaves as before after an
+update, run `omarchy restart shell`.
 
 ## Usage
 
